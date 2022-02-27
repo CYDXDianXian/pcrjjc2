@@ -1,16 +1,19 @@
 from json import load, dump
 from nonebot import get_bot, on_command
 from hoshino import priv
-from hoshino.typing import NoticeSession
+from hoshino.typing import NoticeSession, MessageSegment
 from .pcrclient import pcrclient, ApiException, bsdkclient
 from asyncio import Lock
 from os.path import dirname, join, exists
 from copy import deepcopy
 from traceback import format_exc
 from .safeservice import SafeService
+from .create_img import generate_info_pic, generate_support_pic
+from hoshino.util import pic2b64
 import time
 
-sv_help = '''[竞技场绑定 uid] 绑定竞技场排名变动推送，默认双场均启用
+sv_help = '''
+[竞技场绑定 uid] 绑定竞技场排名变动推送，默认双场均启用
 [竞技场查询 (uid)] 查询竞技场简要信息
 [停止竞技场订阅] 停止战斗竞技场排名变动推送
 [停止公主竞技场订阅] 停止公主竞技场排名变动推送
@@ -18,17 +21,25 @@ sv_help = '''[竞技场绑定 uid] 绑定竞技场排名变动推送，默认双
 [启用公主竞技场订阅] 启用公主竞技场排名变动推送
 [删除竞技场订阅] 删除竞技场排名变动推送绑定
 [竞技场订阅状态] 查看排名变动推送绑定状态
-[详细查询 (uid)] 查询详细状态'''
+[详细查询 (uid)] 查询账号详细信息
+[查询群数] 查询bot所在群的数目
+[查询竞技场订阅数] 查询绑定账号的总数量
+[清空竞技场订阅] 清空所有绑定的账号(仅限主人)
+'''.strip()
 
 sv = SafeService('竞技场推送',help_=sv_help, bundle='pcr查询')
 
 @sv.on_fullmatch('竞技场帮助', only_to_me=False)
 async def send_jjchelp(bot, ev):
+    await bot.send(ev, f'{sv_help}')
+
+@sv.on_fullmatch('查询群数', only_to_me=False)
+async def group_num(bot, ev):
     self_ids = bot._wsr_api_clients.keys()
     for sid in self_ids:
         gl = await bot.get_group_list(self_id=sid)
-        msg = f"本Bot目前服务群数目{len(gl)}"
-    await bot.send(ev, f'{sv_help}\n{msg}')
+        msg = f"本Bot目前正在为【{len(gl)}】个群服务"
+    await bot.send(ev, f'{msg}')
 
 curpath = dirname(__file__)
 config = join(curpath, 'binds.json')
@@ -102,6 +113,27 @@ def save_binds():
     with open(config, 'w') as fp:
         dump(root, fp, indent=4)
 
+@sv.on_fullmatch('查询竞技场订阅数', only_to_me=False)
+async def pcrjjc_number(bot, ev):
+    global binds, lck
+
+    async with lck:
+        await bot.send(ev, f'当前竞技场已订阅的账号数量为【{len(binds)}】个')
+
+@sv.on_fullmatch('清空竞技场订阅', only_to_me=False)
+async def pcrjjc_del(bot, ev):
+    global binds, lck
+
+    async with lck:
+        if not priv.check_priv(ev, priv.SUPERUSER):
+            await bot.send(ev, '抱歉，您的权限不足，只有bot主人才能进行该操作！')
+            return
+        else:
+            num = len(binds)
+            binds.clear()
+            save_binds()
+            await bot.send(ev, f'已清空全部【{num}】个已订阅账号！')
+
 @sv.on_rex(r'^竞技场绑定 ?(\d{13})$')
 async def on_arena_bind(bot, ev):
     global binds, lck
@@ -145,8 +177,8 @@ async def on_query_arena(bot, ev):
             
             await bot.finish(ev, 
 f'''昵称：{res['user_info']["user_name"]}
-jjc：{res['user_info']["arena_rank"]}
-pjjc：{res['user_info']["grand_arena_rank"]}
+jjc排名：{res['user_info']["arena_rank"]}
+pjjc排名：{res['user_info']["grand_arena_rank"]}
 最后登录：{last_login_str}''', at_sender=False)
         except ApiException as e:
             await bot.finish(ev, f'查询出错，{e}', at_sender=True)
@@ -168,34 +200,19 @@ async def on_query_arena_all(bot, ev):
                 id = binds[uid]['id']
         try:
             res = await query(id)
-            arena_time = int (res['user_info']['arena_time'])
-            arena_date = time.localtime(arena_time)
-            arena_str = time.strftime('%Y-%m-%d',arena_date)
-
-            grand_arena_time = int (res['user_info']['grand_arena_time'])
-            grand_arena_date = time.localtime(grand_arena_time)
-            grand_arena_str = time.strftime('%Y-%m-%d',grand_arena_date)
-            
-            last_login_time = int (res['user_info']['last_login_time'])
-            last_login_date = time.localtime(last_login_time)
-            last_login_str = time.strftime('%Y-%m-%d %H:%M:%S',last_login_date)
-            
-            await bot.finish(ev, 
-f'''id：{res['user_info']["viewer_id"]}
-昵称：{res['user_info']["user_name"]}
-公会：{res["clan_name"]}
-简介：{res['user_info']["user_comment"]}
-最后登录：{last_login_str}
-jjc：{res['user_info']["arena_rank"]}
-pjjc：{res['user_info']["grand_arena_rank"]}
-战力：{res['user_info']["total_power"]}
-等级：{res['user_info']["team_level"]}
-jjc场次：{res['user_info']["arena_group"]}
-jjc创建日：{arena_str}
-pjjc场次：{res['user_info']["grand_arena_group"]}
-pjjc创建日：{grand_arena_str}
-角色数：{res['user_info']["unit_num"]}
-''', at_sender=False)
+            sv.logger.info('开始生成竞技场查询图片...') # 通过log显示信息
+            # result_image = await generate_info_pic(res, cx)
+            result_image = await generate_info_pic(res)
+            result_image = pic2b64(result_image) # 转base64发送，不用将图片存本地
+            result_image = MessageSegment.image(result_image)
+            result_support = await generate_support_pic(res)
+            result_support = pic2b64(result_support) # 转base64发送，不用将图片存本地
+            result_support = MessageSegment.image(result_support)
+            sv.logger.info('竞技场查询图片已准备完毕！')
+            try:
+                await bot.finish(ev, f"\n{str(result_image)}\n{result_support}", at_sender=True)
+            except Exception as e:
+                sv.logger.info("do nothing")
         except ApiException as e:
             await bot.finish(ev, f'查询出错，{e}', at_sender=True)
 
@@ -298,6 +315,18 @@ async def on_arena_schedule():
                 await bot.send_group_msg(
                     group_id = int(info['gid']),
                     message = f'[CQ:at,qq={info["uid"]}]pjjc：{last[1]}->{res[1]}'
+                )
+                
+            if res[0] < last[0] and info['arena_on']:
+                await bot.send_group_msg(
+                    group_id = int(info['gid']),
+                    message = f'[CQ:at,qq={info["uid"]}]jjc：{last[0]}->{res[0]} ▲{last[0]-res[0]}'
+                )
+
+            if res[1] < last[1] and info['grand_arena_on']:
+                await bot.send_group_msg(
+                    group_id = int(info['gid']),
+                    message = f'[CQ:at,qq={info["uid"]}]pjjc：{last[1]}->{res[1]} ▲{last[1]-res[1]}'
                 )
         except ApiException as e:
             sv.logger.info(f'对{info["id"]}的检查出错\n{format_exc()}')
